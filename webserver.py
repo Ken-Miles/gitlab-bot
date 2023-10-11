@@ -417,8 +417,6 @@ settings = [
     GenericSetting("Gitlab Permissions", "Whether you want your Gitlab account to be viewable.", emojidict.get('gitlab')),
 ]
 
-GITLAB_URL = "https://gitlab.ucls.uchicago.edu"
-
 app = FastAPI(title="my goofy api", version=".007")
 limiter = Limiter(key_func=get_remote_address)
 app.state.limiter = limiter
