@@ -1,37 +1,37 @@
 from http import HTTPStatus
 from functools import lru_cache
 from io import BytesIO
+from discord.audit_logs import F
+from discord.utils import MISSING
+import discord
 import fastapi
 from fastapi import FastAPI, Depends, Header, Request, HTTPException
-from fastapi.responses import HTMLResponse, RedirectResponse, Response
-import uvicorn
+from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse, Response, JSONResponse, StreamingResponse
 from slowapi.errors import RateLimitExceeded
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
-import logging
-import asyncio
 from fastapi.security import OAuth2PasswordBearer
-from typing import Annotated, Optional, List, Dict, Union, Any
+from typing import Annotated, Optional, List, Dict, Union, Any, Type
 from tortoise import Tortoise, fields
 from tortoise.models import Model
 import aiohttp
 import os
-from pydantic import BaseModel
 from aidenlib.main import dchyperlink, makeembed, getorfetch_channel, makeembed_bot, dctimestamp
 import discord
 import requests
-import io
 from io import BytesIO
 import datetime
 from dateutil import parser
-import tortoise
-import json as Json
 import traceback
-from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from enum import Enum
+from dateparser import parse
+import discord.utils
+import string
+import random
 
-if __name__ == "__main__": from events import gl_id, gl_secret, redirect, client_id, client_secret, scopes
-
+if __name__ == "webserver": 
+    from events import gl_id, gl_secret, redirect, client_id, client_secret, scopes
+    from main import logger_, token, handler
 
 codes = {
     100: "Continue",
@@ -110,6 +110,21 @@ emojidict: Dict[Union[str, bool], str] = {
     False: "<a:X_:1046808381266067547>",
 }
 
+def get_random_state(length):
+    return ''.join(random.choices(string.ascii_letters + string.digits, k=length))
+
+
+HEADER = """<!DOCTYPE html><head>
+<title>my website ig</title>
+<link rel='icon' href='https://i.ibb.co/QrwTwB9/amogus-impostor.jpg'></head>"""
+
+
+class Router:
+    def db_for_read(self, model: Type[Model]):
+        return "slave"
+
+    def db_for_write(self, model: Type[Model]):
+        return "master"
 
 class Base(Model):
     dbid = fields.IntField(pk=True,generated=True)
@@ -332,6 +347,7 @@ class GitlabApiUser(Base):
     discordid = fields.BigIntField(unique=True)
     username = fields.TextField(null=True)
     gitlab_url = fields.TextField()
+    state = fields.TextField()
     token = fields.TextField(null=True)
     refresh_token = fields.TextField(null=True)  
     expires_in = fields.BigIntField(null=True) 
@@ -342,6 +358,7 @@ class GitlabApiUser(Base):
 
 class DiscordAuthUser(Base):
     discordid = fields.BigIntField(unique=True)
+    botid = fields.BigIntField()
     token_type = fields.TextField(null=True)
     token = fields.TextField(null=True)
     refresh_token = fields.TextField(null=True)  
@@ -399,23 +416,29 @@ class GuildSettings(Base):
     class Meta:
         table = "GuildSettings"
 
-class GenericSetting:
-    def __init__(self, name: str, description: str, emoji: str):
-        self.name = name
-        self.description = description
-        self.emoji = emoji
+class LinkedRoles(Base):
+    type = fields.IntField()
+    key = fields.TextField()
+    name = fields.TextField()
+    description = fields.TextField()
+    name_localizations = fields.TextField(null=True)
+    description_localizations = fields.TextField(null=True)
 
-    def __dict__(self):
-        return {
-            "name": self.name,
-            "description": self.description,
-            "emoji": self.emoji,
-        }
+    class Meta:
+        table = 'LinkedRoles'
 
-settings = [
-    GenericSetting("DM Permissions", "Whether you want to be DMed by the bot or not.", "📩"),
-    GenericSetting("Gitlab Permissions", "Whether you want your Gitlab account to be viewable.", emojidict.get('gitlab')),
-]
+class UserLinkedRoles(Base):
+    discordid = fields.BigIntField()
+    value = fields.TextField()
+    valuetype = fields.TextField() # bool, int, str
+
+    class Meta:
+        table = "UserLinkedRoles"
+
+# settings = [
+#     GenericSetting("DM Permissions", "Whether you want to be DMed by the bot or not.", "📩"),
+#     GenericSetting("Gitlab Permissions", "Whether you want your Gitlab account to be viewable.", emojidict.get('gitlab')),
+# ]
 
 app = FastAPI(title="my goofy api", version=".007")
 limiter = Limiter(key_func=get_remote_address)
@@ -442,18 +465,50 @@ def loadips():
         ips = list(set(ips))
         admins = list(set(admins))
 
-allowed_endpoints=["/gitlab/oauth","/gitlab/auth","/discord/oauth","/discord/auth",]
+loadips()
 
-discordid_ip = {}
-
-class GithubWebhook(BaseModel):
-    test: str
+allowed_endpoints=["/gitlab/oauth","/gitlab/auth","/discord/oauth","/discord/auth",'/teapot','/discord/oauth/general',
+'/discord/oauth/linkedroles/','/discord/oauth/linkedroles']
 
 async def check_auth(request: Request, call_next):
-    if request.client.host not in ips and request.url.path not in allowed_endpoints:
-        return Response(status_code=403, content="{'detail': 'Forbidden: get off my website bozo lmao'}", media_type="application/json")
+    if request.client.host not in ips and request.client.host not in admins and request.url.path not in allowed_endpoints:
+        return JSONResponse(status_code=403, content={'detail': 'Forbidden: get off my website bozo lmao'}, media_type="application/json")
         #return HTTPException(status_code=403, detail="Forbidden")
     return await call_next(request)
+
+webhook_gitlab_url = "https://gitlab.ucls.uchicago.edu"
+DISCORD_API = "https://discord.com/api/v10"
+
+MAX_SESSIONS = 2
+
+_sessions: List[aiohttp.ClientSession] = []
+
+async def get_session(session_num: int=0, session_name: Optional[Union[str, int]]=None, **kwargs) -> aiohttp.ClientSession:
+    """Get's a session from the current pool of sessions. Will give the first session by default.
+    Max amount of sessions can be changed by changing the MAX_SESSIONS variable.
+    You can optionally provide a session_name to get a specific session. Depricated dont use this
+    Kwargs will be passed into ClientSession constructor."""
+    if len(_sessions) < MAX_SESSIONS: _sessions.append(aiohttp.ClientSession(**kwargs))
+    return _sessions[session_num]
+
+async def close_session(session: Optional[aiohttp.ClientSession]=None, session_num: int=0) -> None:
+    """Closes the specified connection and removes from the connectionn pool."""
+    if session is None:
+        session = _sessions.pop(session_num)
+    elif session in _sessions:
+        _sessions.remove(session)
+    await session.close()
+    return
+
+async def close_sessions(sessions: List[aiohttp.ClientSession]=[], session_nums: List[int]=[], close_all: bool=False) -> None:
+    """Closes the specified connections and removes from the connection pool."""
+    if close_all:
+        sessions = _sessions
+    for session in sessions:
+        await close_session(session)
+    for session_num in session_nums:
+        await close_session(session_num=session_num)
+    return
 
 @app.middleware("http")
 async def middleware(request: Request, call_next):
@@ -470,7 +525,7 @@ async def gitlab_webhook_old(request: Request, data: dict):
 async def gitlab_webhook(request: Request, data: dict):
     session = aiohttp.ClientSession()
     json = data
-    print(json)
+    #print(json)
     webhook = discord.Webhook.from_url("https://discord.com/api/webhooks/1159745272432304128/plSlbPTZGms0czv3BK9uXWjMBz3KrdjPNry2DRKPldA3ZtOQj_ko9kaljJAbAt-dAKYk",session=session)
     emb = None
     if request.headers.get('X-Gitlab-Event') == "Push Hook":
@@ -490,7 +545,8 @@ async def gitlab_webhook(request: Request, data: dict):
     else:
         print(request.headers.get('X-Gitlab-Event'))
     
-    await webhook.send(embed=emb,username=json.get('project').get('path_with_namespace'),avatar_url=await downloadoropen_repoimg(json.get('project').get('id'),json.get('project').get('avatar_url')))
+    avatar = await downloadoropen_repoimg(json.get('project').get('id'),json.get('project').get('avatar_url'))
+    await webhook.send(embed=emb,username=json.get('project').get('path_with_namespace'),avatar_url=avatar if avatar else MISSING)
     await session.close()
 
 async def parse_pushhook(json: dict) -> discord.Embed:
@@ -498,7 +554,7 @@ async def parse_pushhook(json: dict) -> discord.Embed:
     emb = makeembed_bot(title=f"Branch {branch} was pushed ({json.get('total_commits_count')} commits)",
     url=json.get('project').get('web_url')+'/commits/'+branch,
     author=json.get('user_username')+(f' ({json.get("user_name")})' if json.get('user_name') != json.get('user_username') else ''),
-    author_url=f"{GITLAB_URL}/{json.get('user_username')}/",
+    author_url=f"{webhook_gitlab_url}/{json.get('user_username')}/",
     author_icon_url=json.get('user_avatar'),color=discord.Colour.brand_green())
 
     desc = f"{json.get('user_username')} pushed to {dchyperlink(json.get('repository').get('homepage')+'/commits/'+branch,branch)} of {dchyperlink(json.get('project').get('web_url'), json.get('project').get('path_with_namespace'))} ({dchyperlink(json.get('project').get('web_url')+'/compare/'+json.get('before')+'...'+json.get('after'),'Compare changes')})\n\n"
@@ -514,7 +570,7 @@ async def parse_tagpushhook(json: dict) -> discord.Embed:
     emb = makeembed_bot(title=f"Tag {branch} was updated ({json.get('total_commits_count')} commits)",
     url=json.get('project').get('web_url')+'/commits/'+branch,
     author=json.get('user_username')+(f' ({json.get("user_name")})' if json.get('user_name') != json.get('user_username') else ''),
-    author_url=f"{GITLAB_URL}/{json.get('user_username')}/",
+    author_url=f"{webhook_gitlab_url}/{json.get('user_username')}/",
     author_icon_url=json.get('user_avatar'),color=discord.Colour.yellow())
     return emb
 
@@ -522,7 +578,7 @@ async def parse_issueevent(json: dict) -> discord.Embed:
     emb = makeembed_bot(title=f"Issue #{json.get('object_attributes').get('iid')} {json.get('object_attributes').get('state')}: {json.get('object_attributes').get('title')}",
     url=json.get('object_attributes').get('url'),
     author=json.get('user').get('username')+(f' ({json.get("user").get("name")})' if json.get('user').get('name') != json.get('user').get('username') else ''),
-    author_url=f"{GITLAB_URL}/{json.get('user').get('username')}/",author_icon_url=json.get('user').get('avatar_url'),color=discord.Colour.brand_red(),
+    author_url=f"{webhook_gitlab_url}/{json.get('user').get('username')}/",author_icon_url=json.get('user').get('avatar_url'),color=discord.Colour.brand_red(),
     timestamp=parser.parse(json.get('object_attributes').get('created_at')))
 
     desc = "Assignees:\n" if len(json.get('assignees',[])) > 0 else ""
@@ -543,7 +599,7 @@ async def parse_issueevent(json: dict) -> discord.Embed:
 async def parse_comment(json: dict) -> discord.Embed:
     emb = makeembed_bot(title=f"Comment on {json.get('object_attributes').get('noteable_type')} #{json.get('object_attributes').get('id')}: {json.get('object_attributes').get('note')}",
     url=json.get('object_attributes').get('url'),author=json.get('user').get('username')+(f' ({json.get("user").get("name")})' if json.get('user').get('name') != json.get('user').get('username') else ''),
-    author_url=f"{GITLAB_URL}/{json.get('user').get('username')}/",author_icon_url=json.get('user').get('avatar_url'),
+    author_url=f"{webhook_gitlab_url}/{json.get('user').get('username')}/",author_icon_url=json.get('user').get('avatar_url'),
     timestamp=parser.parse(json.get('object_attributes').get('created_at')),color=discord.Colour.brand_green())
     
     desc = f"{dchyperlink(json.get('repository').get('homepage'),json.get('project').get('path_with_namespace'))}"
@@ -556,7 +612,7 @@ async def parse_comment(json: dict) -> discord.Embed:
 async def parse_mergerequest(json: dict) -> discord.Embed:
     emb = makeembed_bot(title=f"Merge Request #{json.get('object_attributes').get('iid')} {json.get('object_attributes').get('state')}: {json.get('object_attributes').get('title')}",
     url=json.get('object_attributes').get('url'), author=json.get('user').get('username')+(f' ({json.get("user").get("name")})' if json.get('user').get('name') != json.get('user').get('username') else ''),
-    author_url=f"{GITLAB_URL}/{json.get('user').get('username')}/",author_icon_url=json.get('user').get('avatar_url'),
+    author_url=f"{webhook_gitlab_url}/{json.get('user').get('username')}/",author_icon_url=json.get('user').get('avatar_url'),
     timestamp=parser.parse(json.get('object_attributes').get('created_at')),color=discord.Colour.green())
 
     desc = ""
@@ -570,7 +626,7 @@ async def parse_mergerequest(json: dict) -> discord.Embed:
 async def parse_deploymentevent(json: dict) -> discord.Embed:
     emb = makeembed_bot(title=f"Deployment #{json.get('deployment_id')} {json.get('status')}: {json.get('commit_title')}",
     url=json.get('commit_url'), author=json.get('user').get('username')+(f' ({json.get("user").get("name")})' if json.get('user').get('name') != json.get('user').get('username') else ''),
-    author_url=f"{GITLAB_URL}/{json.get('user').get('username')}/",author_icon_url=json.get('user').get('avatar_url'),
+    author_url=f"{webhook_gitlab_url}/{json.get('user').get('username')}/",author_icon_url=json.get('user').get('avatar_url'),
     timestamp=parser.parse(json.get('status_changed_at')),color=discord.Colour.green())
 
     desc = "Deployment of commit "+dchyperlink(json.get('commit_url'),json.get('short_sha'))+" to "+json.get('environment')+" was "+json.get('status')+".\n\n"
@@ -584,12 +640,11 @@ async def parse_addmember(json: dict) -> discord.Embed:
     removed = json.get('group_access') is None
     emb = makeembed_bot(title=f"Member {json.get('user_username')} was {'removed from' if removed else 'added/altered in '} group {json.get('group_name')}",
     url=json.get('group_path'), author=json.get('user_username')+(f' ({json.get("user_name")})' if json.get('user_name') != json.get('user_username') else ''),
-    author_url=f"{GITLAB_URL}/{json.get('user_username')}/",author_icon_url=json.get('user_avatar'),
+    author_url=f"{webhook_gitlab_url}/{json.get('user_username')}/",author_icon_url=json.get('user_avatar'),
     timestamp=parser.parse(json.get('created_at')),color=discord.Colour.green())
 
     desc = f"{dchyperlink(json.get('group_path'),json.get('group_name')+' ('+json.get('group_path'))})\n"
     desc += f"{json.get('user_username')} was added to the group as a {json.get('group_access')}.\n\n"
-
     emb.description = desc
     return emb
 
@@ -597,7 +652,7 @@ async def parse_addmember(json: dict) -> discord.Embed:
 @limiter.limit("5/minute",error_message="bro you need to stop spamming my website")
 async def addip(request: Request, ip: str):
     if request.client.host not in admins:
-        return Response(status_code=403, content="{'detail': 'Forbidden: get off my website bozo lmao'}", media_type="application/json")
+        return JSONResponse(status_code=403, content={'detail': 'Forbidden: get off my website bozo lmao'}, media_type="application/json")
     try:
         with open('ips.txt','a') as f:
             f.write(f"\n{ip}")
@@ -611,7 +666,7 @@ async def addip(request: Request, ip: str):
 @limiter.limit("5/minute",error_message="bro you need to stop spamming my website")
 async def removeip(request: Request, ip: str):
     if request.client.host not in admins:
-        return Response(status_code=403, content="{'detail': 'Forbidden: get off my website bozo lmao'}", media_type="application/json")
+        return JSONResponse(status_code=403, content={'detail': 'Forbidden: get off my website bozo lmao'}, media_type="application/json")
     try:
         with open('ips.txt','r') as f:
             lines = f.read().splitlines()
@@ -628,14 +683,14 @@ async def removeip(request: Request, ip: str):
 @limiter.limit("5/minute",error_message="bro you need to stop spamming my website")
 async def listips(request: Request):
     if request.client.host not in admins:
-        return Response(status_code=403, content="{'detail': 'Forbidden: get off my website bozo lmao'}", media_type="application/json")
+        return JSONResponse(status_code=403, content={'detail': 'Forbidden: get off my website bozo lmao'}, media_type="application/json")
     return {"ips": ips}
 
 @app.get('/ip/refresh')
 @limiter.limit("5/minute",error_message="bro you need to stop spamming my website")
 async def refreships(request: Request):
     if request.client.host not in admins:
-        return Response(status_code=403, content="{'detail': 'Forbidden: get off my website bozo lmao'}", media_type="application/json")
+        return JSONResponse(status_code=403, content={'detail': 'Forbidden: get off my website bozo lmao'}, media_type="application/json")
     try:
         loadips()
         return {"status": "ok"}
@@ -645,7 +700,7 @@ async def refreships(request: Request):
 @limiter.limit("5/minute",error_message="bro you need to stop spamming my website")
 async def addadmin(request: Request, ip: str):
     if request.client.host not in admins:
-        return Response(status_code=403, content="{'detail': 'Forbidden: get off my website bozo lmao'}", media_type="application/json")
+        return JSONResponse(status_code=403, content={'detail': 'Forbidden: get off my website bozo lmao'}, media_type="application/json")
     try:
         with open('admins.txt','a') as f:
             f.write(f"\n{ip}")
@@ -659,7 +714,7 @@ async def addadmin(request: Request, ip: str):
 @limiter.limit("5/minute",error_message="bro you need to stop spamming my website")
 async def removeadmin(request: Request, ip: str):
     if request.client.host not in admins:
-        return Response(status_code=403, content="{'detail': 'Forbidden: get off my website bozo lmao'}", media_type="application/json")
+        return JSONResponse(status_code=403, content={'detail': 'Forbidden: get off my website bozo lmao'}, media_type="application/json")
     try:
         with open('admins.txt','r') as f:
             lines = f.read().splitlines()
@@ -676,7 +731,7 @@ async def removeadmin(request: Request, ip: str):
 @limiter.limit("5/minute",error_message="bro you need to stop spamming my website")
 async def listadmins(request: Request):
     if request.client.host not in admins:
-        return Response(status_code=403, content="{'detail': 'Forbidden: get off my website bozo lmao'}", media_type="application/json")
+        return JSONResponse(status_code=403, content={'detail': 'Forbidden: get off my website bozo lmao'}, media_type="application/json")
     return {"admins": admins}
 
 async def downloadoropen_repoimg(projectid,url) -> Optional[BytesIO]:
@@ -706,14 +761,22 @@ async def downloadoropen_repoimg(projectid,url) -> Optional[BytesIO]:
     with open(filename,'wb') as f:
         if r is not None: f.write(r.content)
         f.seek(0)
-        file = BytesIO(f.read())
+        if r is not None:
+            file = BytesIO(f.read())
+        else:
+            file = None
     os.chdir('../../')
     return file
 
 @app.get('/')
 @limiter.limit("5/minute",error_message="bro you need to stop spamming my website")
 async def index(request: Request):
-    return {"status": "ok"}
+    return JSONResponse({"status": "ok don't care"})
+
+@app.get('/favicon.ico')
+@limiter.limit("5/minute",error_message="bro you need to stop spamming my website")
+async def favicon(request: Request):
+    return FileResponse('https://i.ibb.co/QrwTwB9/amogus-impostor.jpg',302)
 
 @app.get('/gitlab/auth')
 @limiter.limit("5/minute",error_message="bro you need to stop spamming my website")
@@ -722,14 +785,27 @@ async def gitlab_auth(request: Request,code: str, state: str):
 
 @app.get('/gitlab/oauth')
 @limiter.limit("5/minute",error_message="bro you need to stop spamming my website")
-async def gitlab_oauth(request: Request, code: str, state: str):
+async def gitlab_oauth(request: Request, code: str, state: Optional[str]=None):
     session = aiohttp.ClientSession()
 
-    discordid = discordid_ip[request.client.host]
+    #gitlab_url = (await get_discord_auth(discordid)).gitlab_url
+    gitlab_url = (await GitlabApiUser.get(state=state)).gitlab_url
 
-    r = await session.get(f"{gitlab_url}/oauth/token?client_id={gl_id}&client_secret={gl_secret}&code={code}&grant_type=authorization_code&redirect_uri={redirect}/gitlab/oauth")
+    r = await session.post(f"{webhook_gitlab_url}/oauth/token",#headers={"Accept": "application/json"},
+    data = {'client_id': gl_id,
+    'client_secret': gl_secret,
+    'code': code,
+    'grant_type': 'authorization_code',
+    'redirect_uri': redirect})
     r = await r.json()
-    await GitlabApiUser.create(discordod=discordid, token=r.get('access_token'),refresh_token=r.get('refresh_token'),expires_in=r.get('expires_in'),created_at=datetime.datetime.fromtimestamp(int(r.get('created_at',None))) if r.get('created_at',None) else None,scope=r.get('scope'))
+    rr = await session.get(f'{webhook_gitlab_url}/api/v4/user',headers={"Authorization": "Bearer "+r.get('access_token')})
+    rr = await rr.json()
+    user = await GitlabApiUser.get(gitlab_url=gitlab_url, username=rr.get('username')) 
+    user.token = r.get('access_token')
+    user.refresh_token = r.get('refresh_token')
+    user.expires_in = r.get('expires_in')
+    user.created_at = datetime.datetime.fromtimestamp(int(r.get('created_at'))) if r.get('created_at',None) else datetime.datetime.now()
+    await user.save()
     await session.close()
     return {'200': "bro i think it wored"}
 
@@ -738,25 +814,132 @@ async def gitlab_oauth(request: Request, code: str, state: str):
 async def discord_auth(request: Request, code: str, state: str=""):
     return RedirectResponse(url=f"{str(request.url).replace('auth','oauth')}",status_code=302)
 
-@app.get('/discord/oauth')
+@app.get('/discord/oauth/')
 @limiter.limit("5/minute",error_message="bro you need to stop spamming my website")
 async def discord_oauth(request: Request, code: str, state: str=""):
-    api = "https://discord.com/api/v10"
-    session = aiohttp.ClientSession()
+    return RedirectResponse(url=f"{str(request.url).replace('oauth','oauth/general')}",status_code=302)
+
+async def authorize_discord_token(request: Request, code: str, state: Optional[str]=None, *, session: Optional[aiohttp.ClientSession]=None, close_whendone: bool=False) -> Optional[dict]:
+    """close_whendone = close_session when done"""
+    if session is None:
+        session = await get_session()
+
     headers = {
-    'Content-Type': 'application/x-www-form-urlencoded'
+        'Content-Type': 'application/x-www-form-urlencoded'
     }
-    #print(f'{request.url.scheme}://{request.url.hostname}{(":"+str(request.url.port) if request.url.port else "")}/discord/oauth')
-    r = await session.post(f'{api}/oauth2/token',headers=headers,auth=aiohttp.BasicAuth(str(client_id), str(client_secret)),data={
+    r = await session.post(f'{DISCORD_API}/oauth2/token',headers=headers,auth=aiohttp.BasicAuth(str(client_id), str(client_secret)),data={
     'grant_type': 'authorization_code',
     'code': code,
-    'redirect_uri': f'{request.url.scheme}://{request.url.hostname}{(":"+str(request.url.port) if request.url.port else "")}/discord/oauth',
+    'redirect_uri': f'{request.url.scheme}://{request.url.hostname}{(":"+str(request.url.port) if request.url.port else "")}{request.url.path}',
     })
     r = await r.json()
+    if close_whendone: await close_session(session)
+    return r
 
+async def push_metadata(token: str, roles: dict[str, Union[bool, str, int]],platform_name: str='Windows 98'):
+    """roles = [rolename, rolevalue]"""
+    url = f"{DISCORD_API}/users/@me/applications/:id/role-connection"
+    headers = {
+        'Content-Type': 'application/json',
+        'Authorization': f'Bearer {token}'
+    }
+    session = await get_session()
+    r = await session.put(url,headers=headers,json={
+        'platform_name': platform_name,
+        **roles,
+    })
+    return await r.json()
+
+async def register_metadata(roles: Union[list[dict[str, Union[str, int]]],dict]):
+    """Provide a dictionary or a list of dictionaries similar to the following example:
+    Adds the provided roles to the LinkedRoles database table and pushed to discord.
+    
+    {
+        key: 'cookieseaten',
+        name: 'Cookies Eaten',
+        description: 'Cookies Eaten Greater Than',
+        type: 2, (see :class:LinkedRoleType)
+    },
+    {
+        key: 'allergictonuts',
+        name: 'Allergic To Nuts',
+        description: 'Is Allergic To Nuts',
+        type: 7,
+    },"""
+    url = f"{DISCORD_API}/applications/{client_id}/role-connections/metadata"
+    if isinstance(roles,dict): roles: list[dict[str, Union[str, int]]] = [roles]
+    else: roles: list[dict[str, Union[str, int]]] = roles
+
+    for role in roles:
+        if await LinkedRoles.filter(key=role.get('key')).exists():
+            return Exception(f'{role} already exists')
+        if role.get('using_db',False): role.pop('using_db')
+        await LinkedRoles.create(**role) # type: ignore
+    session = await get_session()
+    headers = {
+        'Content-Type': 'application/json',
+        'Authorization': f'Bot {token}'
+    }
+    r = await session.put(url, headers=headers, json=roles)
+    print(r)
+    print(await r.json())
+    return await r.json()
+
+async def get_metadata() -> dict:
+    """Get's all the metadata from discord."""
+    url = f"{DISCORD_API}/applications/{client_id}/role-connections/metadata"
+    headers = {
+        'Authorization': f'Bot {token}'
+    }
+    session = await get_session()
+    r = await session.get(url,headers=headers)
+    return await r.json()
+
+class LinkedRoleType(Enum):
+    """All the types of linked roles."""
+    number_lt = 1
+    """Number is less than.
+    Ex: Number of cookies is less than"""
+    number_gt = 2
+    """Number is greater than.
+    Ex: Number of cookies is greater than"""
+    number_eq = 3
+    """Number.
+    Ex: Number of bitches is 0"""
+    number_neq = 4
+    """Not a number.
+    Ex: Number of bitches is not 0"""
+    datetime_lt = 5
+    """Datetime (less than.)
+    Ex: Days ago since baking their first cookie"""
+    datetime_gt = 6
+    """Datetime (greater than.)
+    Ex: Days since baking their first cookie"""
+    boolean_eq = 7
+    """Regular Boolean.
+    Ex: Is Allergic To Nuts"""
+    boolean_neq = 8
+    """Not a boolean.
+    Ex: Is Not Allergic To Nuts"""
+
+    @staticmethod
+    def all():
+        return [LinkedRoleType.number_lt, LinkedRoleType.number_gt, LinkedRoleType.number_eq, LinkedRoleType.number_neq, LinkedRoleType.datetime_lt, LinkedRoleType.datetime_gt, LinkedRoleType.boolean_eq, LinkedRoleType.boolean_neq]
+
+    def __int__(self):
+        return self.value
+    
+    def __str__(self):
+        return self.name
+
+@app.get('/discord/oauth/general/')
+@limiter.limit("5/minute",error_message="bro you need to stop spamming my website")
+async def discord_oauth_general(request: Request, code: str, state: Optional[str]=None):
     #print(r)
+    session = await get_session()
+    r = await authorize_discord_token(request, code, state, session=session)
 
-    rr = await session.get(f'{api}/oauth2/@me',headers={"Authorization": "Bearer "+r.get('access_token')})
+    rr = await session.get(f'{DISCORD_API}/oauth2/@me',headers={"Authorization": f"Bearer {r.get('access_token')}"})
 
     rr = await rr.json()
     await session.close()
@@ -764,14 +947,69 @@ async def discord_oauth(request: Request, code: str, state: str=""):
     #print(rr)
     #'user': {'id': '458657458995462154', 'username': 'aidenpearce3066', 'avatar': '3acfe15b991e017b80f0430797927156', 'discriminator': '0', 'public_flags': 4194368, 'flags': 4194368, 'banner': None, 'accent_color': None, 'global_name': 'Aiden Pearce', 'avatar_decoration_data': None, 'banner_color': None}}
     discordid = rr.get('user').get('id')
-    discordid_ip[request.client.host] = discordid
 
     try:
-        await DiscordAuthUser.create(discordid=discordid,token_type=r.get('token_type'),token=r.get('access_token'),refresh_token=r.get('refresh_token'),expires_in=r.get('expires_in'),scope=r.get('scope'))
+        await DiscordAuthUser.create(discordid=discordid,botid=client_id,token_type=r.get('token_type'),token=r.get('access_token'),refresh_token=r.get('refresh_token'),expires_in=r.get('expires_in'),scope=r.get('scope'))
         return {'200': "bro i think it worked, ok go back to discord link your gitlab"}
     except:
         traceback.print_exc()
-    
+
+@app.get('/discord/oauth/linkedroles/')
+async def oauth_linkedroles(request: Request):
+    """Get the linked roles page."""
+    return RedirectResponse(
+        discord.utils.oauth_url(client_id, scopes=['identify','role_connections.write'],
+        redirect_uri='https://aidenpearce.space/discord/oauth/general/',state=get_random_state(16)),
+    )
+
+@app.post('/discord/oauth/linkedroles/user/update/')
+@limiter.limit("5/minute",error_message="bro you need to stop spamming my website")
+async def linked_role_update(request: Request, data: dict):
+    # data = {'userid': 123, rolename: rolevalue, rolename2: rolevalue2}
+    try:
+        token = (await DiscordAuthUser.get(discordid=data.get('userid'))).token
+        data.pop('userid')
+        await push_metadata(token, data)
+    except:
+        traceback.print_exc()
+        return {'500': 'error'}
+
+@app.post('/discord/oauth/linkedroles/push/')
+async def linked_role_register(request: Request, data: list[dict[str, Union[str, int]]]):
+    """Push linked roles to discord.
+    Take a list of dictionaries.
+    {
+        'key': 'basicallyid',
+        'name': "Shown name",
+        "description": 'desc',
+        type: 2 (see LinkedRoleType)
+    }"""
+    # data = [{'key': 'basicallyid', 'name': "Shown name", "description": 'desc', type: 2 -> LinkedRoleType}]
+    try:
+        for role in data:
+            if await LinkedRoles.filter(key=role.get('key')).exists():
+                return Response(f'{role} already exists',422)
+        await register_metadata(data)
+        return Response(status_code=204)
+    except Exception as e:
+        return Response(e, 500)
+
+@app.get('/discord/oauth/linkedroles/get')
+async def linked_role_get(request: Request):
+    """Get all linked roles."""
+    return JSONResponse(await get_metadata())
+
+@app.get('/teapot')
+async def teapot(request: Request):
+    return Response("hahaha im so funny i made a teapot\nNO SCREW YOU 418 ERROR FOR YOU",418)
+
+@app.get('/images/')
+async def get_image(request: Request):
+    for image in os.listdir('/images'):
+        if (os.path.isdir(f'/images/{image}') 
+        or image.startswith('_') 
+        or image.startswith('.')): 
+            continue
 
 
 async def check_user_auth(id: int):
@@ -797,7 +1035,8 @@ async def get_gitlab_auth(id: int):
 
 async def check_discord_auth(id: int):
     try:
-        return await DiscordAuthUser.get(discordid=id) is not None
+        return await DiscordAuthUser.filter(discordid=id).exists()
+        #return (await DiscordAuthUser.get(discordid=id))
     except:
         traceback.print_exc()
         return False
@@ -809,8 +1048,8 @@ async def get_discord_auth(id: int):
         traceback.print_exc()
         return None
 
-async def create_gitlab(id: int, gitlab_url: str):
-    await GitlabApiUser.create(discordid=id,gitlab_url=gitlab_url)
+async def create_gitlab(id: int, gitlab_url: str,username: str,state: str):
+    await GitlabApiUser.create(discordid=id,gitlab_url=gitlab_url,username=username,state=state)
 
 async def delete_user(id: int):
     return await delete_discord_user(id) and await delete_gitlab_user(id)
@@ -875,7 +1114,61 @@ async def create_user_settings(id: int, dm: bool=False, **kwargs):
 async def startup_event():
     await Tortoise.init(config_file='config.yml')
     await Tortoise.generate_schemas()
+    # LinkedRole(LinkedRoleType.number_eq, key='bitches',name='Number of Bitches',description='The amount of bitches you pull')
+    # print(await register_linked_roles(LinkedRole(LinkedRoleType.number_eq, key='bitches',name='Number of Bitches',description='The amount of bitches you pull')))
+    # return
 
-if __name__ == '__main__':
-    uvicorn.run(app, host="127.0.0.1", port=3066,log_config='log.ini')
+@app.on_event('shutdown')
+async def shutdown_event():
+    await close_sessions()
 
+# if __name__ == '__main__':
+#     uvicorn.run(app, host="127.0.0.1", port=3066,log_config='log.ini')
+
+
+class LinkedRole:
+    type: LinkedRoleType
+    key: str
+    name: str
+    description: str
+    name_localizations: Optional[str]
+    description_localizations: Optional[str]
+    __dict: dict
+
+    def __init__(self, type: Union[int, LinkedRoleType], *, key: str, name: str, description: str, name_localizations: Optional[str]=None, description_localizations: Optional[str]=None):
+        self.type = LinkedRoleType(int(type))
+        self.key = key
+        self.name = name
+        self.description = description
+        self.name_localizations = name_localizations
+        self.description_localizations = description_localizations
+        self.__dict = {
+            "type": int(type),
+            "key": key,
+            "name": name,
+            "description": description,
+            "name_localizations": name_localizations,
+            "description_localizations": description_localizations
+        }
+    
+    @staticmethod
+    def from_json(json: dict):
+        return LinkedRole(**json)
+    
+    def to_json(self):
+        self.__dict = {
+            "type": int(self.type),
+            "key": self.key,
+            "name": self.name,
+            "description": self.description,
+            "name_localizations": self.name_localizations,
+            "description_localizations": self.description_localizations
+        }
+        print(self.__dict)
+        return self.__dict
+    
+    def __str__(self):
+        return f"LinkedRole(type={int(self.type)},key={self.key},name={self.name},description={self.description},name_localizations={self.name_localizations},description_localizations={self.description_localizations})"
+
+    def __dict__(self):
+        return self.to_json()

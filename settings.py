@@ -15,7 +15,7 @@ class SettingsCog(commands.Cog):
         self.gitlab_context_menu = app_commands.ContextMenu(name="Gitlab",
             callback=self.gitlab,type=AppCommandType.user)
     
-    @commands.hybrid_group(name="settings", fallback='all')
+    @commands.hybrid_group(name="settings")
     async def settings(self, ctx: commands.Context):
         """Change your settings."""
         pass
@@ -29,8 +29,8 @@ class SettingsCog(commands.Cog):
         elif user.dm != value:
             await update_user_settings(ctx.author.id,dm=value)
         else:
-            return await ctx.send("You already have that setting set.")
-        await ctx.send("Successfully updated your settings.")
+            return await ctx.reply("You already have that setting set.")
+        await ctx.reply("Successfully updated your settings.")
 
     @settings.command(name='showgitlab')
     @app_commands.describe(value="Whether to show your gitlab username in your profile. (True = Show)")
@@ -41,8 +41,8 @@ class SettingsCog(commands.Cog):
         elif user.showgitlab != value:
             await update_user_settings(ctx.author.id,showgitlab=value)
         else:
-            return await ctx.send("You already have that setting set.")
-        await ctx.send("Successfully updated your settings.")
+            return await ctx.reply("You already have that setting set.")
+        await ctx.reply("Successfully updated your settings.")
 
     async def gitlab(self, interaction: discord.Interaction, user: discord.User):
         await interaction.response.defer(thinking=True,ephemeral=True)

@@ -122,7 +122,7 @@ async def main():
                 bot.session3 = session3
                 discord.utils.setup_logging(handler=handler)
                 for file in os.listdir('./'):
-                    if not file.startswith('_') and file not in ["main.py",'db.py','webserver.py','settings.py'] and file.endswith('.py'):
+                    if not file.startswith('_') and file not in ["main.py",'db.py','webserver.py','run.py','settings.py'] and file.endswith('.py'):
                         await bot.load_extension(f'{file[:-3]}')
                 await bot.load_extension("jishaku")
                 #await bot.load_extension("aidenlib.main.helpercog")
