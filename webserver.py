@@ -1,17 +1,17 @@
 from http import HTTPStatus
 from functools import lru_cache
 from io import BytesIO
+from urllib.parse import urlencode
 from discord.audit_logs import F
 from discord.utils import MISSING
 import discord
-import fastapi
 from fastapi import FastAPI, Depends, Header, Request, HTTPException
 from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse, Response, JSONResponse, StreamingResponse
+from fastapi.security import OAuth2PasswordBearer
 from slowapi.errors import RateLimitExceeded
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
-from fastapi.security import OAuth2PasswordBearer
-from typing import Annotated, Optional, List, Dict, Union, Any, Type
+from typing import Optional, List, Dict, Union, Any, Type
 from tortoise import Tortoise, fields
 from tortoise.models import Model
 import aiohttp
@@ -776,7 +776,7 @@ async def index(request: Request):
 @app.get('/favicon.ico')
 @limiter.limit("5/minute",error_message="bro you need to stop spamming my website")
 async def favicon(request: Request):
-    return FileResponse('https://i.ibb.co/QrwTwB9/amogus-impostor.jpg',302)
+    return FileResponse('favicon.ico',302)
 
 @app.get('/gitlab/auth')
 @limiter.limit("5/minute",error_message="bro you need to stop spamming my website")
@@ -844,7 +844,7 @@ async def push_metadata(token: str, roles: dict[str, Union[bool, str, int]],plat
         'Authorization': f'Bearer {token}'
     }
     session = await get_session()
-    r = await session.put(url,headers=headers,json={
+    r = await session.put(url,headers=headers,data={
         'platform_name': platform_name,
         **roles,
     })
@@ -934,7 +934,7 @@ class LinkedRoleType(Enum):
 
 @app.get('/discord/oauth/general/')
 @limiter.limit("5/minute",error_message="bro you need to stop spamming my website")
-async def discord_oauth_general(request: Request, code: str, state: Optional[str]=None):
+async def discord_oauth_general(request: Request, code: str, state: Optional[str]=None, redirect: Optional[str]=None):
     #print(r)
     session = await get_session()
     r = await authorize_discord_token(request, code, state, session=session)
@@ -950,9 +950,20 @@ async def discord_oauth_general(request: Request, code: str, state: Optional[str
 
     try:
         await DiscordAuthUser.create(discordid=discordid,botid=client_id,token_type=r.get('token_type'),token=r.get('access_token'),refresh_token=r.get('refresh_token'),expires_in=r.get('expires_in'),scope=r.get('scope'))
-        return {'200': "bro i think it worked, ok go back to discord link your gitlab"}
     except:
         traceback.print_exc()
+        return
+    if redirect is None:
+        return JSONResponse({'200': "bro i think it worked, ok go back to discord link your gitlab"})
+    else:
+        print(redirect)
+        print(request.url)
+        return RedirectResponse(url=redirect,status_code=302)
+
+@app.get('/discord/oauth/redirect')
+@limiter.limit("5/minute",error_message="bro you need to stop spamming my website")
+async def discord_oauth_redirect(request: Request, code: str, state: Optional[str]=None, redirect: str='https://cdn.aidenpearce.space/api/auth/oauth/discord'):
+    return RedirectResponse(f'./general/?{request.url.query}&redirect={redirect}', status_code=302)
 
 @app.get('/discord/oauth/linkedroles/')
 async def oauth_linkedroles(request: Request):
