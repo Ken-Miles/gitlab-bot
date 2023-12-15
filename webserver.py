@@ -11,12 +11,12 @@ from fastapi.security import OAuth2PasswordBearer
 from slowapi.errors import RateLimitExceeded
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
-from typing import Optional, List, Dict, Union, Any, Type
+from typing import Optional, List, Dict, Union, Any, Type, Literal
 from tortoise import Tortoise, fields
 from tortoise.models import Model
 import aiohttp
 import os
-from aidenlib.main import dchyperlink, makeembed, getorfetch_channel, makeembed_bot, dctimestamp
+#from aidenlib.main import dchyperlink, makeembed, getorfetch_channel, makeembed_bot, dctimestamp
 import discord
 import requests
 from io import BytesIO
@@ -28,6 +28,7 @@ from dateparser import parse
 import discord.utils
 import string
 import random
+from utils import dchyperlink, makeembed, makeembed_bot, dctimestamp
 
 if __name__ == "webserver": 
     from events import gl_id, gl_secret, redirect, client_id, client_secret, scopes
@@ -467,8 +468,13 @@ def loadips():
 
 loadips()
 
-allowed_endpoints=["/gitlab/oauth","/gitlab/auth","/discord/oauth","/discord/auth",'/teapot','/discord/oauth/general',
-'/discord/oauth/linkedroles/','/discord/oauth/linkedroles']
+allowed_endpoints=[
+"/gitlab/oauth","/gitlab/auth",
+'/teapot',
+"/discord/oauth","/discord/auth",'/discord/oauth/general',
+'/discord/oauth/linkedroles/','/discord/oauth/linkedroles',
+'/gitlab/webhook/fengh','/gitlab/webhook/jmulligan',
+'/taiga','/taiga/webhook']
 
 async def check_auth(request: Request, call_next):
     if request.client.host not in ips and request.client.host not in admins and request.url.path not in allowed_endpoints:
@@ -520,38 +526,89 @@ async def gitlab_webhook_old(request: Request, data: dict):
     # redirect to /gitlab/webhook
     return RedirectResponse(url='/gitlab/webhook',status_code=302)
 
+with open('webhooks.yml','r') as f:
+    wbs = dict(yaml.safe_load(f))
+    JMULLIGAN_WEBHOOK = wbs.get('JMULLIGAN_WEBHOOK')
+    FENGH_WEBHOOK = wbs.get('FENGH_WEBHOOK')
+    TAIGA_WEBHOOK = wbs.get('TAIGA_WEBHOOK')
+
+async def sendwebhook(request: Request, data: Union[dict,discord.Embed], webhook: Union[str,discord.Webhook]):
+    session = aiohttp.ClientSession()
+    if isinstance(data,dict):
+        json = data
+        #print(json)
+        if isinstance(webhook,str):
+            webhook = discord.Webhook.from_url(webhook,session=session)
+        emb = None
+        if request.headers.get('X-Gitlab-Event') == "Push Hook":
+            emb = await parse_pushhook(json)
+        elif request.headers.get('X-Gitlab-Event') == "Tag Push Hook":
+            emb = await parse_tagpushhook(json)
+        elif request.headers.get('X-Gitlab-Event') in ["Issue Hook","Confidential Issue Hook"]:
+            emb = await parse_issueevent(json)
+        elif request.headers.get('X-Gitlab-Event') == "Note Hook":
+            emb = await parse_comment(json)
+        elif request.headers.get('X-Gitlab-Event') == "Merge Request Hook":
+            emb = await parse_mergerequest(json)
+        elif request.headers.get('X-Gitlab-Event') == "Deployment Hook": # cant test this...
+            emb = await parse_deploymentevent(json)
+        elif request.headers.get('X-Gitlab-Event') == "Member Hook": # cant test this either...
+            emb = await parse_addmember(json)
+        else:
+            print(request.headers.get('X-Gitlab-Event'))
+
+        avatar = await downloadoropen_repoimg(json.get('project').get('id'),json.get('project').get('avatar_url'))
+        await webhook.send(embed=emb,username=json.get('project').get('path_with_namespace'),avatar_url=avatar if avatar else MISSING)
+        await session.close()
+    else:
+        if isinstance(webhook,str):
+            webhook = discord.Webhook.from_url(webhook,session=session)
+        await webhook.send(embed=data)
+        await session.close()
+
 @app.post('/gitlab/webhook')
 @limiter.limit("5/minute",error_message="bro you need to stop spamming my website")
 async def gitlab_webhook(request: Request, data: dict):
-    session = aiohttp.ClientSession()
-    json = data
-    #print(json)
-    webhook = discord.Webhook.from_url("https://discord.com/api/webhooks/1159745272432304128/plSlbPTZGms0czv3BK9uXWjMBz3KrdjPNry2DRKPldA3ZtOQj_ko9kaljJAbAt-dAKYk",session=session)
-    emb = None
-    if request.headers.get('X-Gitlab-Event') == "Push Hook":
-        emb = await parse_pushhook(json)
-    elif request.headers.get('X-Gitlab-Event') == "Tag Push Hook":
-        emb = await parse_tagpushhook(json)
-    elif request.headers.get('X-Gitlab-Event') in ["Issue Hook","Confidential Issue Hook"]:
-        emb = await parse_issueevent(json)
-    elif request.headers.get('X-Gitlab-Event') == "Note Hook":
-        emb = await parse_comment(json)
-    elif request.headers.get('X-Gitlab-Event') == "Merge Request Hook":
-        emb = await parse_mergerequest(json)
-    elif request.headers.get('X-Gitlab-Event') == "Deployment Hook": # cant test this...
-        emb = await parse_deploymentevent(json)
-    elif request.headers.get('X-Gitlab-Event') == "Member Hook": # cant test this either...
-        emb = await parse_addmember(json)
-    else:
-        print(request.headers.get('X-Gitlab-Event'))
-    
-    avatar = await downloadoropen_repoimg(json.get('project').get('id'),json.get('project').get('avatar_url'))
-    await webhook.send(embed=emb,username=json.get('project').get('path_with_namespace'),avatar_url=avatar if avatar else MISSING)
-    await session.close()
+    if data.get('user_username',None) == "jmulligan":
+        await sendwebhook(request, data, JMULLIGAN_WEBHOOK)
+    elif data.get('user_username',None) == "fengh":
+        await sendwebhook(request, data, FENGH_WEBHOOK)
+    return Response(status_code=200)
+
+@app.post('/gitlab/webhook/fengh')
+@limiter.limit("5/minute",error_message="bro you need to stop spamming my website")
+async def fengh_gitlab_webhook(request: Request, data: dict):
+    try:
+        await sendwebhook(request, data, FENGH_WEBHOOK)
+        return Response(status_code=200)
+    except Exception as e:
+        print(e)
+        return Response(status_code=500)
+
+@app.post('/gitlab/webhook/jmulligan')
+@limiter.limit("5/minute",error_message="bro you need to stop spamming my website")
+async def jmulligan_gitlab_webhook(request: Request, data: dict):
+    try:       
+        await sendwebhook(request, data, JMULLIGAN_WEBHOOK)
+        return Response(status_code=200)
+    except Exception as e:
+        print(e)
+        return Response(status_code=500)
+
+@app.post('/taiga/webhook')
+@limiter.limit("5/minute",error_message="bro you need to stop spamming my website")
+async def taiga_webhook(request: Request, data: dict):
+    try:
+        await sendwebhook(request, await parse_taiga(data), TAIGA_WEBHOOK)
+        return Response(status_code=200)
+    except Exception as e:
+        print(data)
+        traceback.print_exc()
+        return Response(status_code=500)
 
 async def parse_pushhook(json: dict) -> discord.Embed:
     branch = json.get('ref').split('/')[-1]
-    emb = makeembed_bot(title=f"Branch {branch} was pushed ({json.get('total_commits_count')} commits)",
+    emb = makeembed_bot(title=f"Branch {branch} was pushed ({json.get('total_commits_count')} commit{'s' if int(json.get('total_commits_count',0)) != 1 else ''})",
     url=json.get('project').get('web_url')+'/commits/'+branch,
     author=json.get('user_username')+(f' ({json.get("user_name")})' if json.get('user_name') != json.get('user_username') else ''),
     author_url=f"{webhook_gitlab_url}/{json.get('user_username')}/",
@@ -646,6 +703,194 @@ async def parse_addmember(json: dict) -> discord.Embed:
     desc = f"{dchyperlink(json.get('group_path'),json.get('group_name')+' ('+json.get('group_path'))})\n"
     desc += f"{json.get('user_username')} was added to the group as a {json.get('group_access')}.\n\n"
     emb.description = desc
+    return emb
+
+class TaigaActionType(Enum):
+    create = "create"
+    delete = "delete"
+    change = "change"
+    test = "test"
+
+class TaigaObjectType(Enum):
+    milestone = "milestone"
+    userstory = "userstory"
+    task = "task"
+    issue = "issue"
+    wikipage = "wikipage"
+    test = "test"
+
+async def parse_taiga(json: dict) -> discord.Embed:
+    """"Parses a webhook payload from Taiga and makes it a discord.Embed so that it can be sent."""
+
+    """The action field contains notification type with values: "create", "delete", "change" or "test".
+    Will be casted to enum TaigaActionType."""
+    action: TaigaActionType #Literal["create", "delete", "change", "test"]
+    
+    """The type field contains the type of object with values: "milestone", "userstory", "task", "issue", "wikipage" or "test".
+    Will be casted to enum TaigaObjectType."""
+    type: TaigaObjectType #Literal["milestone", "userstory", "task", "issue", "wikipage", "test"]
+    
+    """The by field contains the information of the user thast generate the notification.
+    Ex:
+    "id": 6,
+        "permalink": "http://localhost:9001/profile/user1",
+        "username": "user1",
+        "full_name": "Purificacion Montero",
+        "photo": "//media.taiga.io/avatar.80x80_q85_crop.png",
+        "gravatar_id": "464bb6d514c3ecece1b87136ceeda1da"
+    """
+    by: dict[str, Union[str, int]]
+
+    """The date field contains the date and time of the current notification.
+    Ex: '2016-04-12T12:08:18.309Z'"""
+    date: datetime.datetime
+
+    """The data field contains the current object information.
+    Ex (milestone):
+
+    "data": {
+        "permalink": "http://localhost:9001/project/project-0/taskboard/sprint-4",
+        "project": {
+            "id": 1,
+            "permalink": "http://localhost:9001/project/project-0",
+            "name": "Project Example 0",
+            "logo_big_url": null
+        },
+        "owner": {
+            "id": 6,
+            "permalink": "http://localhost:9001/profile/user1",
+            "username": "user1",
+            "full_name": "Purificacion Montero",
+            "photo": "//media.taiga.io/avatar.80x80_q85_crop.png",
+            "gravatar_id": "464bb6d514c3ecece1b87136ceeda1da"
+        },
+        "id": 13,
+        "name": "Sprint 4",
+        "slug": "sprint-4",
+        "estimated_start": "2016-03-02",
+        "estimated_finish": "2016-03-24",
+        "created_date": "2016-04-12T12:08:18+0000",
+        "modified_date": "2016-04-12T12:09:42+0000",
+        "closed": false,
+        "disponibility": 0.0
+    }
+    Other examples can be found [here](https://docs.taiga.io/webhooks.html#_configuration)
+    """
+    data: Dict[str, Any]
+
+    """The change field (only present on change notifications) contains the information about the changes made.
+    Will be None if the notification is not a change notification.
+    Ex:
+
+    "change": {
+        "diff": {
+            "estimated_start": {
+                "to": "2016-03-02",
+                "from": "2016-03-02"
+            },
+            "estimated_finish": {
+                "to": "2016-03-24",
+                "from": "2016-03-16"
+            }
+        },
+        "comment": "",
+        "comment_html": "",
+        "delete_comment_date": null
+    }
+    """
+    change: Optional[dict]
+
+    action = TaigaActionType(json.get('action'))
+    type = TaigaObjectType(json.get('type'))
+    by = json.get('by')
+    date = parser.parse(json.get('date'))
+    data = json.get('data')
+    change = json.get('change',None)
+
+    emb_author = f"{by.get('username')} ({by.get('full_name')})"
+    emb_author_url = by.get('permalink')
+    emb_author_photo = by.get('photo')
+
+    title_url = data.get('permalink')
+    if data.get('project',False):
+        title = f"{data.get('project').get('name')}: {action.title()}d {type.title()} {data.get('ref')}"
+
+        thumbnail = data.get('project').get('logo_big_url')
+
+    """Create = Brand Green
+        Delete = Brand Red
+        Change = Yellow
+        Test = Gray"""
+    color: discord.Colour = None
+
+    desc = ''
+
+    if action is TaigaActionType.test:
+        title = "Taiga Webhook"
+        thumbnail = "https://cdn.aidenpearce.space/r/LsyWwY.png?compress=false"
+        desc = "Testing of the Taiga Webhook"
+        color = discord.Colour.lighter_gray()
+    
+    elif type is TaigaObjectType.task or type is TaigaObjectType.userstory:
+        if action is TaigaActionType:
+            if type is TaigaObjectType.task:
+                desc = f"""**Subject**: {data.get('subject')}
+                **Instance**: {dchyperlink(data.get('user_story').get('subject'),data.get('user_story').get('permalink'))}
+                **Description**: {data.get('description') if data.get('description') else 'Nothing'}
+                **Assigned to**: {data.get('assigned_to').get('username') if data.get('assigned_to') else 'Nobody'}
+                **Status**: {data.get('status').get('name')}"""
+            elif type is TaigaObjectType.userstory:
+                desc = f"""**Subject**: {data.get('subject')}
+                **Description**: {data.get('description') if data.get('description') else 'Nothing'}
+                **Assigned to**: {data.get('assigned_to').get('username') if data.get('assigned_to') else 'Nobody'}
+                **Status**: {data.get('status').get('name')}"""
+            color = discord.Colour.brand_green()
+
+        elif action is TaigaActionType.change:
+            diff = dict(change.get('diff'))
+            if diff.get('status'):
+                desc += f"**Old status**: {diff.get('status').get('from')}\n"
+            if diff.get('subject'):
+                desc += f"**Old subject**: {diff.get('subject').get('from')}\n"
+            if diff.get('assigned_to'):
+                desc += f"**Old assigned**: {diff.get('assigned_to').get('from') if diff.get('assigned_to').get('from') else 'Nobody'}\n"
+            if diff.get('description_diff'):
+                desc += f"**Old description**: {diff.get('description_diff').get('from') if diff.get('description_diff').get('from') else 'Nothing'}\n"
+            if diff.get('assigned_users'):
+                desc += f"**Old assigned**: {diff.get('assigned_users').get('from') if diff.get('assigned_users').get('from') else 'Nobody'}\n"
+
+            key = diff[next(iter(diff))]
+            if key == 'subject':
+                desc += f"**New subject**: {diff.get('subject').get('to')}\n"
+            elif key == 'status':
+                desc += f"**New status**: {diff.get('status').get('to')}\n"
+            elif key == 'assigned_to':
+                desc += f"**New assigned**: {diff.get('assigned_to').get('to') if diff.get('assigned_to').get('to') else 'Nobody'}\n"
+            elif key == 'description_diff':
+                desc += f"**New description**: {diff.get('description_diff').get('to') if diff.get('description_diff').get('to') else 'Nothing'}\n"
+            elif key == 'assigned_users':
+                desc += f"**New assigned**: {diff.get('assigned_users').get('to') if change.get('diff').get('assigned_users').get('to') else 'Nobody'}\n"
+
+            color = discord.Colour.orange()
+
+        elif action is TaigaActionType.delete:
+            if type is TaigaObjectType.task:
+                desc = f"""**Subject**: {data.get('subject')}
+                **Instance**: {dchyperlink(data.get('user_story').get('subject'),data.get('user_story').get('permalink'))}
+                **Description**: {data.get('description') if data.get('description') else 'Nothing'}
+                **Status**: {data.get('status').get('name')}"""
+            elif type is TaigaObjectType.userstory:
+                desc = f"""**Subject**: {data.get('subject')}
+                **Description**: {data.get('description') if data.get('description') else 'Nothing'}
+                **Old status**: {data.get('status').get('name')}"""
+            
+            color = discord.Colour.brand_red()
+        
+    emb: discord.Embed = makeembed_bot(title=title,
+    timestamp=date,url=title_url,thumbnail=thumbnail,
+    author=emb_author,author_url=emb_author_url,author_icon_url=emb_author_photo,
+    description=desc,color=color)
+
     return emb
 
 @app.get('/ip/add')
@@ -1013,15 +1258,6 @@ async def linked_role_get(request: Request):
 @app.get('/teapot')
 async def teapot(request: Request):
     return Response("hahaha im so funny i made a teapot\nNO SCREW YOU 418 ERROR FOR YOU",418)
-
-@app.get('/images/')
-async def get_image(request: Request):
-    for image in os.listdir('/images'):
-        if (os.path.isdir(f'/images/{image}') 
-        or image.startswith('_') 
-        or image.startswith('.')): 
-            continue
-
 
 async def check_user_auth(id: int):
     try:
